@@ -173,3 +173,67 @@ Currently, there is no default runner, but there will be in the future, a way of
 
     # Just run it. Input can be a "Resource", a model or directly a file
     ecore2simplejava.run('examples/inputs/input.ecore')
+
+
+Execution identity and Python compatibility
+------------------------------------------
+
+Python 3.12 or newer is required. The mapping cache belongs to one execution:
+source EObject identity, mapping and bound parameters identify a result. Positional
+and equivalent keyword calls share that result. There is no eviction while running;
+cyclic mappings see a reserved result before its body traverses other objects.
+Memory grows with the number of distinct mapping calls in that execution.
+
+By default caches are cleared on success and failure. With
+``clean_mappings_cache=False``, a successful execution retains its cache for inspection
+until ``context.clear_cache()`` or release of that execution context. A new run always
+has a fresh cache, even with that flag. Cross-run result reuse is intentionally removed:
+results belong to the output resources of their own execution. Mapping calls outside
+an active matching transformation raise RuntimeError, including previous cache hits.
+``cache_info`` and ``cache_clear`` remain available on decorated mappings. Sources
+and other parameters must remain hashable as required by the previous cache API.
+
+Use ``motra.m2m.current_execution()`` and ``current_result()`` in new mapping bodies.
+Existing bodies using the injected global ``result`` remain compatible; its old value
+is restored on success, exceptions and nested calls. ContextVar isolates execution
+selection but does not eliminate that compatibility injection. No thread safety,
+async mapping or Python without GIL guarantee is made.
+
+An exception clears caches and newly created output resources; mutations to input
+or inout models, external resources and files are not rolled back. Reentrant runs
+restore the outer execution context and do not clear its cache. Chain resource sets
+are similarly restored on errors, and errors in transformation bodies propagate
+without being relabelled as missing chain contexts.
+
+Annotations may refer to names defined later. Available types are remembered at
+decoration time; forward names are resolved at execution time, after metamodels
+have been registered in ``transformation.metamodels``; ordinary
+function globals and classifier/package names in those metamodels are available.
+Unresolved or invalid annotations raise errors rather than silently changing dispatch.
+Annotations are trusted Python code, not a security boundary.
+
+M2T creates a new rendering context for every run. Rendered text is not memoized,
+since it depends on mutable models, template parameters and helper side effects.
+Nested runs and caught template errors restore the outer rendering buffers. Existing
+polymorphic registration order and guards remain supported. Files are UTF-8; the
+historical file tag replaces its destination even for ``append=True``. Multiple
+file writes are not a transaction.
+
+Building and testing
+--------------------
+
+Build metadata declares a static version without importing the runtime, and includes
+trace, chainengine and the Ecore metamodel in sdist/wheel. Existing generated chainengine
+sources are shipped; builds do not regenerate them or download a generation plugin.
+For intentional regeneration, review the generated diff separately::
+
+    python -m pyecoregen.cli -e motra/metamodels/chainengine.ecore -o motra --user-module motra.chainengine.chainengine_mixins
+
+Do not regenerate trace or examples as part of a normal build. Then::
+
+    python -m build
+    python -m pytest tests
+
+The migration harness installs explicit local ecosystem forks and uses a prepared
+offline wheelhouse. Mako must be prepared there as a real dependency; it is not
+replaced by a stub or silently ignored. HOT remains an unmerged research branch.

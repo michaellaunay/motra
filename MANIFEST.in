@@ -1,1 +1,5 @@
-include README.rst CHANGELOG.md LICENSE motra/metamodels/*.ecore
+include README.rst CHANGELOG.md LICENSE
+recursive-include motra/metamodels *.ecore
+recursive-include tests *.py
+recursive-include examples *.py *.ecore
+recursive-include doc *.rst

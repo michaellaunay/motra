@@ -1,4 +1,4 @@
-from pyecore.resources import ResourceSet, Resource
+from pyecore.resources import ResourceSet, Resource, URI
 from pyecore.ecore import EObject
 """Mixins to be implemented by user."""
 
@@ -11,11 +11,18 @@ class ChainMixin:
 
     def run(self, input=None):
         parameter = input
+        marker = object()
+        previous = getattr(self, 'resource_set', marker)
         self.resource_set = ResourceSet()
-        for operation in self.operations:
-            parameter = operation.execute(operation.prepare_execution(parameter))
-        del self.resource_set
-        return parameter
+        try:
+            for operation in self.operations:
+                parameter = operation.execute(operation.prepare_execution(parameter))
+            return parameter
+        finally:
+            if previous is marker:
+                del self.resource_set
+            else:
+                self.resource_set = previous
 
 
 class OperationMixin:
@@ -28,7 +35,7 @@ class OperationMixin:
         if isinstance(param, Resource):
             return param
         rset = self.chain.resource_set
-        if isinstance(param, str):
+        if isinstance(param, (str, URI)):
             resource = rset.get_resource(param)
         if isinstance(param, EObject):
             if param.eResource:
@@ -36,6 +43,8 @@ class OperationMixin:
             else:
                 resource = rset.create_resource(f"tmp_{id(param)}")
                 resource.append(param)
+        if not isinstance(param, (Resource, str, URI, EObject)):
+            raise TypeError('A chain step requires a resource, model or URI')
         return resource
 
     def execute(self, model=None):
@@ -102,10 +111,10 @@ class M2MMixin:
         }
         try:
             rset = self.chain.resource_set
-            result = self.implementation.run(resource_set=rset, **input_dict)
-            return result.outputs[0]
         except AttributeError as e:
-            raise RuntimeError("The transformation has to be launched from a chain")
+            raise RuntimeError("The transformation has to be launched from a chain") from e
+        result = self.implementation.run(resource_set=rset, **input_dict)
+        return result.outputs[0]
 
 
 class M2TMixin:
@@ -117,13 +126,13 @@ class M2TMixin:
     def execute(self, resource):
         try:
             rset = self.chain.resource_set
-            result = self.implementation.run(resource)
-            result = result.rstrip()
-            if result:
-                print(result)
-            return resource
         except AttributeError as e:
-            raise RuntimeError("The transformation has to be launched from a chain")
+            raise RuntimeError("The transformation has to be launched from a chain") from e
+        result = self.implementation.run(resource, resource_set=rset)
+        result = result.rstrip()
+        if result:
+            print(result)
+        return resource
 
 
 class LoadMixin:

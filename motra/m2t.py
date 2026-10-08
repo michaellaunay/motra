@@ -1,5 +1,7 @@
-import inspect
+import contextvars
 import functools
+import inspect
+import typing
 from io import StringIO
 from pathlib import Path
 import pyecore.ecore as Ecore
@@ -7,15 +9,20 @@ from pyecore.utils import DynamicEPackage
 from pyecore.resources import ResourceSet, Resource, URI
 from mako.template import Template
 from mako.runtime import Context, Undefined
+from .m2m import _signature
+
+
+_context = contextvars.ContextVar('motra_m2t_context', default=None)
 
 
 def in_file(path, append, body):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve the historical file tag replacement behavior (including append=True).
     mode = 'w+' if append else 'w'
-    with open(path, mode) as f:
+    with open(path, mode, encoding='utf-8') as f:
         f.write(body)
-    return ""
+    return ''
 
 
 file_tag = """
@@ -35,108 +42,121 @@ class Transformation(object):
         self._polymorphic_calls = {}
         self.helpers = []
 
+    def _remember_type(self, annotation):
+        if hasattr(annotation, '_staticEClass'):
+            package = annotation.eClass.ePackage
+        elif isinstance(annotation, Ecore.EClass):
+            package = annotation.ePackage
+        else:
+            return
+        if package is not None:
+            self.metamodels.add(package)
+
+    def _resolve_type(self, f):
+        namespace = {}
+        for package in self.metamodels:
+            namespace[package.name] = DynamicEPackage(package)
+            for classifier in package.eClassifiers:
+                namespace[classifier.name] = getattr(classifier, 'python_class', classifier)
+        parameter = next(iter(_signature(f).parameters.values()))
+        annotation = typing.get_type_hints(f, localns=namespace).get(parameter.name)
+        if annotation is None:
+            raise ValueError(f'Missing source annotation for template {f.__name__!r}')
+        self._remember_type(annotation)
+        f.source_type = annotation
+        return annotation
+
     def run(self, model, resource_set=None, **kwargs):
+        for (f, pname, etype), wrapper in self.mains:
+            self._resolve_type(f)
+        for wrappers in self._polymorphic_calls.values():
+            for wrapper in wrappers:
+                self._resolve_type(wrapper.__wrapped__)
         if isinstance(model, Resource):
-            model = model.contents[0]  # FIXME deal with mutliple root resources
+            model = model.contents[0]
         elif isinstance(model, (str, URI)):
-            rset = resource_set if resource_set else ResourceSet()
+            rset = resource_set if resource_set is not None else ResourceSet()
             for metamodel in self.metamodels:
                 rset.metamodel_registry[metamodel.nsURI] = metamodel
-            resource = rset.get_resource(model)
-            model = resource.contents[0]  # FIXME deal with mutliple root resources
+            model = rset.get_resource(model).contents[0]
         buf = StringIO()
         myprops = {'in_file': in_file}
-        myprops.update(**kwargs)
+        myprops.update(kwargs)
         for f in self.helpers:
             myprops[f.__name__] = f
         for name, templates in self._polymorphic_calls.items():
             myprops[name] = templates[0]
         for metamodel in self.metamodels:
             myprops[metamodel.name] = DynamicEPackage(metamodel)
-
-        ctx = Context(buf,**myprops)
-        sp = inspect.currentframe()
-        sp.f_globals["mycontext"] = ctx
-
-        self.template = Template
-        for element in (model, *model.eAllContents()):
-            for (fun, pname, etype), template in self.mains:
-                if isinstance(element, etype):
-                    params = {pname: element}
-                    template = Template(self.full_template)
-                    template.get_def(fun.__name__).render_context(ctx, element)
-        del sp.f_globals["mycontext"]
-        return buf.getvalue()
+        ctx = Context(buf, **myprops)
+        token = _context.set((self, ctx))
+        try:
+            template = Template(self.full_template)
+            for element in (model, *model.eAllContents()):
+                for (fun, pname, etype), wrapper in self.mains:
+                    if isinstance(element, fun.source_type):
+                        template.get_def(fun.__name__).render_context(ctx, element)
+            return buf.getvalue()
+        finally:
+            _context.reset(token)
+            buf.close()
 
     def _register_template(self, f):
-        def_template = """
-<%def name="{}({})">{}</%def>
-""".format(f.__name__, (', '.join(x for x in inspect.signature(f).parameters)), f.__doc__)
-        self.full_template += def_template
+        self.full_template += '\n<%def name="{}({})">{}</%def>\n'.format(
+            f.__name__, ', '.join(_signature(f).parameters), f.__doc__)
 
     def main(self, f):
-        cached_fun = functools.lru_cache()(f)
         if not f.__doc__:
-            return cached_fun
-        parameter = next(iter(inspect.signature(f).parameters.values()))
-        self.mains.append(((f, parameter.name, parameter.annotation), cached_fun))
-        ec = parameter.annotation
-        if hasattr(ec, '_staticEClass'):
-            self.metamodels.add(parameter.annotation.eClass.ePackage)
-        elif isinstance(ec, Ecore.EObject):
-            self.metamodels.add(eclass.ePackage)
+            return f
+        parameter = next(iter(_signature(f).parameters.values()))
+        try:
+            self._resolve_type(f)
+        except NameError:
+            pass
+        self.mains.append(((f, parameter.name, None), f))
         self._register_template(f)
-        return cached_fun
+        return f
 
     def template(self, f=None, when=None):
-        if not f:
-            return functools.partial(self.template,
-                                     when=when)
+        if f is None:
+            return functools.partial(self.template, when=when)
         f.when = when
-
         @functools.wraps(f)
         def inner(*args, **kwargs):
-            try:
-                var_name = f.__code__.co_varnames[0]
-                index = f.__code__.co_varnames.index(var_name)
-                self_parameter = args[index]
-            except IndexError:
-                self_parameter = kwargs[var_name]
-            candidates = self._polymorphic_calls[f.__name__]
-            for candidate in candidates:
-                candidate = candidate.__wrapped__.__wrapped__
-                parameter = next(iter(inspect.signature(candidate).parameters.values()))
-                if isinstance(self_parameter, parameter.annotation):
-                    # func = candidate
-                    # break
-                    if not candidate.when or candidate.when(*args, **kwargs):
+            active = _context.get()
+            if active is None or active[0] is not self:
+                raise RuntimeError('Template cannot be executed outside of the transformation.')
+            ctx = active[1]
+            parameter = next(iter(_signature(f).parameters))
+            self_parameter = _signature(f).bind(*args, **kwargs).arguments[parameter]
+            for wrapper in self._polymorphic_calls[f.__name__]:
+                candidate = wrapper.__wrapped__
+                if isinstance(self_parameter, candidate.source_type):
+                    if candidate.when is None or candidate.when(*args, **kwargs):
                         func = candidate
                         break
             else:
                 return Undefined
-            # Create object for the context
-            sp = inspect.currentframe()
-            try:
-                ctx = sp.f_globals["mycontext"]
-            except KeyError:
-                raise RuntimeError("Template cannot be executed outside of the "
-                                   "the transformation.")
             old_io = ctx._buffer_stack[0]
             buf = StringIO()
             ctx._buffer_stack[0] = buf
-            func.template.get_def(func.__name__).render_context(ctx, *args, **kwargs)
-            ctx._buffer_stack[0] = old_io
-            return buf.getvalue()
-        cached_fun = functools.lru_cache()(inner)
-        self._polymorphic_calls.setdefault(f.__name__,[]).append(cached_fun)
-        if not f.__doc__:
-            return cached_fun
-        def_template = """<%def name="{}({})">{}</%def>""".format(f.__name__, (', '.join(x for x in inspect.signature(f).parameters)), f.__doc__)
-        f.template = Template(def_template)
-        parameter = next(iter(inspect.signature(f).parameters.values()))
-        f.f_parameter = parameter
-        self.metamodels.add(parameter.annotation.eClass.ePackage)
-        return cached_fun
+            try:
+                func.template.get_def(func.__name__).render_context(ctx, *args, **kwargs)
+                return buf.getvalue()
+            finally:
+                ctx._buffer_stack[0] = old_io
+                buf.close()
+        self._polymorphic_calls.setdefault(f.__name__, []).append(inner)
+        if f.__doc__:
+            definition = '<%def name="{}({})">{}</%def>'.format(
+                f.__name__, ', '.join(_signature(f).parameters), f.__doc__)
+            f.template = Template(definition)
+            try:
+                self._resolve_type(f)
+            except NameError:
+                pass
+        return inner
 
     def helper(self, f):
         self.helpers.append(f)
+        return f
