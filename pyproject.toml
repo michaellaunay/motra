@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -27,7 +27,7 @@ classifiers = [
 Homepage = "https://github.com/pyecore/motra"
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=9.0.3"]
 
 [tool.setuptools.packages.find]
 include = ["motra*"]
